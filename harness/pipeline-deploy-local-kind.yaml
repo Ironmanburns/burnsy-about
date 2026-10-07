@@ -1,7 +1,7 @@
 pipeline:
   name: Deploy About Local Kind
   identifier: Deploy_About_Local_Kind
-  projectIdentifier: default_project
+  projectIdentifier: github_copilot_testing
   orgIdentifier: default
   tags:
     app: about
@@ -9,7 +9,7 @@ pipeline:
   properties:
     ci:
       codebase:
-        connectorRef: account.Github
+        connectorRef: burnsy_about
         repoName: Ironmanburns/burnsy-about
         build: <+input>
   variables:

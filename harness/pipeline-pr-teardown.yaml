@@ -1,7 +1,7 @@
 pipeline:
-  name: PR Teardown About Local Kind
-  identifier: PR_Teardown_About_Local_Kind
-  projectIdentifier: default_project
+  name: PR Teardown About
+  identifier: PR_Teardown_About
+  projectIdentifier: github_copilot_testing
   orgIdentifier: default
   tags:
     app: about
@@ -10,18 +10,21 @@ pipeline:
   properties:
     ci:
       codebase:
-        connectorRef: account.Github
+        connectorRef: burnsy_about
         repoName: Ironmanburns/burnsy-about
         build: <+input>
   variables:
     - name: appName
       type: String
       value: about
+    - name: prNumber
+      type: String
+      value: <+input>
   stages:
     - stage:
         name: Teardown
         identifier: Teardown
-        description: Delete PR preview namespace
+        description: Remove ephemeral PR preview release and namespace
         type: CI
         spec:
           cloneCodebase: false
@@ -38,16 +41,32 @@ pipeline:
             steps:
               - step:
                   type: Run
-                  name: Delete Preview Namespace
-                  identifier: Delete_Preview_Namespace
+                  name: Helm Preview Teardown
+                  identifier: Helm_Preview_Teardown
                   spec:
                     connectorRef: dockerhub_public
-                    image: bitnami/kubectl:1.31
+                    image: alpine/helm:3.16.3
                     shell: Sh
                     command: |-
                       set -e
+                      apk add --no-cache kubectl >/dev/null
                       APP="<+pipeline.variables.appName>"
-                      PR="<+trigger.prNumber>"
+                      PR="<+pipeline.variables.prNumber>"
                       NS="games-pr-${APP}-${PR}"
-                      echo "Deleting namespace $NS"
-                      kubectl delete ns "$NS" --ignore-not-found --wait=false
+                      RELEASE="${APP}-pr-${PR}"
+                      echo "Tearing down preview ${RELEASE} in ${NS}"
+                      if kubectl get namespace "${NS}" >/dev/null 2>&1; then
+                        helm uninstall "${RELEASE}" --namespace "${NS}" || true
+                        kubectl delete namespace "${NS}" --wait=true
+                        echo "Deleted namespace ${NS}"
+                      else
+                        echo "Namespace ${NS} already gone"
+                      fi
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: Abort
+
+
