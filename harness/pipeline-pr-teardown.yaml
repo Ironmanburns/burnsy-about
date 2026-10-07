@@ -1,0 +1,53 @@
+pipeline:
+  name: PR Teardown About Local Kind
+  identifier: PR_Teardown_About_Local_Kind
+  projectIdentifier: default_project
+  orgIdentifier: default
+  tags:
+    app: about
+    target: local-kind
+    purpose: pr-teardown
+  properties:
+    ci:
+      codebase:
+        connectorRef: account.Github
+        repoName: Ironmanburns/burnsy-about
+        build: <+input>
+  variables:
+    - name: appName
+      type: String
+      value: about
+  stages:
+    - stage:
+        name: Teardown
+        identifier: Teardown
+        description: Delete PR preview namespace
+        type: CI
+        spec:
+          cloneCodebase: false
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: local_kind_k8s
+              namespace: harness-ci
+              serviceAccountName: harness-games-preview
+              automountServiceAccountToken: true
+              nodeSelector: {}
+              os: Linux
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: Delete Preview Namespace
+                  identifier: Delete_Preview_Namespace
+                  spec:
+                    connectorRef: dockerhub_public
+                    image: bitnami/kubectl:1.31
+                    shell: Sh
+                    command: |-
+                      set -e
+                      APP="<+pipeline.variables.appName>"
+                      PR="<+trigger.prNumber>"
+                      NS="games-pr-${APP}-${PR}"
+                      echo "Deleting namespace $NS"
+                      kubectl delete ns "$NS" --ignore-not-found --wait=false
