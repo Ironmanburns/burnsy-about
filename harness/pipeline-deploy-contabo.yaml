@@ -1,0 +1,176 @@
+# Builds on the Contabo k3s cluster (contabo-delegate), pushes to Docker Hub
+# docker.io/ironmanburns/about (public repo, no pull secret), Trivy CRITICAL gate,
+# then Helm-deploys to Contabo (NodePort 30085). Cloudflare tunnel contabo-k3s routes
+# the public hostname to http://127.0.0.1:30085.
+pipeline:
+  name: Deploy About Contabo
+  identifier: Deploy_About_Contabo
+  projectIdentifier: github_copilot_testing
+  orgIdentifier: default
+  tags:
+    app: about
+    target: contabo
+  properties:
+    ci:
+      codebase:
+        connectorRef: account.Github
+        repoName: Ironmanburns/burnsy-about
+        build: <+input>
+  variables:
+    - name: imageRegistryUser
+      type: String
+      description: Docker Hub login for the push (account connector ironmanburns). Not a secret.
+      value: ironmanburns
+    - name: image
+      type: String
+      description: Image reference without tag.
+      value: docker.io/ironmanburns/about
+    - name: imageTag
+      type: String
+      description: Image tag (pipeline sequence by default). Also pushed as the commit SHA.
+      value: <+pipeline.sequenceId>
+  stages:
+    - stage:
+        name: Build
+        identifier: Build
+        description: Build on Contabo, push to Docker Hub, Trivy CRITICAL gate
+        type: CI
+        delegateSelectors:
+          - contabo
+        spec:
+          cloneCodebase: true
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: contabo_k8s
+              namespace: harness-ci
+              automountServiceAccountToken: true
+              nodeSelector: {}
+              os: Linux
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: Build and Push
+                  identifier: Build_and_Push
+                  spec:
+                    connectorRef: account.ironmanburns
+                    image: gcr.io/kaniko-project/executor:v1.23.2-debug
+                    shell: Sh
+                    envVariables:
+                      DOCKER_USER: <+pipeline.variables.imageRegistryUser>
+                      DOCKER_PASS: <+secrets.getValue("account.ironmanburns_pat")>
+                    command: |-
+                      set -eu
+                      mkdir -p /kaniko/.docker
+                      AUTH=$(printf '%s:%s' "$DOCKER_USER" "$DOCKER_PASS" | base64 | tr -d '\n')
+                      printf '%s\n' "{\"auths\":{\"https://index.docker.io/v1/\":{\"auth\":\"${AUTH}\"},\"docker.io\":{\"auth\":\"${AUTH}\"}}}" > /kaniko/.docker/config.json
+                      unset DOCKER_PASS AUTH
+                      IMAGE="<+pipeline.variables.image>"
+                      TAG="<+pipeline.variables.imageTag>"
+                      SHA="<+codebase.commitSha>"
+                      echo "Pushing ${IMAGE}:${TAG} and ${IMAGE}:${SHA}"
+                      /kaniko/executor \
+                        --dockerfile=Dockerfile \
+                        --context=dir:///harness \
+                        --destination="${IMAGE}:${TAG}" \
+                        --destination="${IMAGE}:${SHA}" \
+                        --ignore-path=/product_uuid \
+                        --snapshot-mode=redo
+              - step:
+                  type: Run
+                  name: Trivy Image Scan
+                  identifier: Trivy_Image_Scan
+                  spec:
+                    connectorRef: account.ironmanburns
+                    image: aquasec/trivy:0.57.1
+                    shell: Sh
+                    envVariables:
+                      DOCKER_USER: <+pipeline.variables.imageRegistryUser>
+                      DOCKER_PASS: <+secrets.getValue("account.ironmanburns_pat")>
+                    command: |-
+                      set -eu
+                      mkdir -p /root/.docker
+                      AUTH=$(printf '%s:%s' "$DOCKER_USER" "$DOCKER_PASS" | base64 | tr -d '\n')
+                      printf '%s\n' "{\"auths\":{\"https://index.docker.io/v1/\":{\"auth\":\"${AUTH}\"},\"docker.io\":{\"auth\":\"${AUTH}\"}}}" > /root/.docker/config.json
+                      unset DOCKER_PASS AUTH
+                      REF="<+pipeline.variables.image>:<+pipeline.variables.imageTag>"
+                      echo "Scanning ${REF}"
+                      trivy image --severity CRITICAL --exit-code 1 --no-progress --timeout 10m "${REF}"
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: Abort
+    - stage:
+        name: Deploy
+        identifier: Deploy
+        description: Helm deploy to Contabo k3s, then check the NodePort on the node loopback
+        type: Deployment
+        when:
+          pipelineStatus: Success
+          condition: (<+pipeline.triggerType> == "MANUAL" || <+codebase.branch> == "main")
+        spec:
+          deploymentType: NativeHelm
+          service:
+            serviceRef: about
+          environment:
+            environmentRef: contabo
+            deployToAll: false
+            infrastructureDefinitions:
+              - identifier: contabo_infra_about
+          execution:
+            steps:
+              - step:
+                  name: Helm Deploy
+                  identifier: Helm_Deploy
+                  type: HelmDeploy
+                  timeout: 10m
+                  spec:
+                    skipDryRun: false
+                    commandFlags:
+                      - commandType: Upgrade
+                        flag: "--set image.repository=<+pipeline.variables.image> --set image.tag=<+pipeline.variables.imageTag> --set service.type=NodePort --set service.nodePort=30085 --set ingress.enabled=false"
+                      - commandType: Install
+                        flag: "--set image.repository=<+pipeline.variables.image> --set image.tag=<+pipeline.variables.imageTag> --set service.type=NodePort --set service.nodePort=30085 --set ingress.enabled=false"
+              - step:
+                  type: ShellScript
+                  name: Verify loopback
+                  identifier: Verify_loopback
+                  timeout: 5m
+                  spec:
+                    shell: Bash
+                    onDelegate: true
+                    delegateSelectors:
+                      - contabo
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          set -uo pipefail
+                          NS=cloudflared
+                          P=verify-about-<+pipeline.sequenceId>
+                          kubectl -n $NS run $P --restart=Never --image=docker.io/curlimages/curl:8.11.1 \
+                            --labels=managed-by=harness --overrides='{"spec":{"hostNetwork":true}}' --command -- \
+                            sh -c 'for i in 1 2 3 4 5 6; do c=$(curl -s -o /dev/null -w %{http_code} --max-time 5 http://127.0.0.1:30085/); echo "127.0.0.1:30085 -> $c"; [ "$c" = 200 ] && exit 0; sleep 5; done; exit 1' >/dev/null
+                          kubectl -n $NS wait --for=jsonpath='{.status.phase}'=Succeeded pod/$P --timeout=120s >/dev/null; RC=$?
+                          kubectl -n $NS logs $P || true
+                          kubectl -n $NS delete pod $P --wait=false >/dev/null || true
+                          exit $RC
+                    environmentVariables: []
+                    outputVariables: []
+            rollbackSteps:
+              - step:
+                  name: Helm Rollback
+                  identifier: Helm_Rollback
+                  type: HelmRollback
+                  timeout: 10m
+                  spec: {}
+        tags: {}
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: StageRollback
